@@ -3,7 +3,3 @@ pandas
 numpy
 yfinance
 openpyxl
-requests
-beautifulsoup4
-lxml
-curl_cffi

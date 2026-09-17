@@ -1,0 +1,1314 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import time
+from datetime import datetime
+
+# ============================================================
+# Streamlit 設定
+# ============================================================
+
+st.set_page_config(
+    page_title="台股當沖選股 v9",
+    page_icon="📈",
+    layout="wide"
+)
+
+# ============================================================
+# 設定
+# ============================================================
+
+STOCK_POOL_FILE = "完整台股股票池.xlsx"
+
+BATCH_SIZE = 80
+PERIOD = "3mo"
+
+MIN_AMOUNT = 50_000_000
+MIN_VOLUME = 3_000
+MIN_AVG_AMOUNT = 30_000_000
+MIN_AVG_VOLUME = 3_000
+
+TOP_N = 10
+
+
+# ============================================================
+# RSI
+# ============================================================
+
+def calc_rsi(close, period=14):
+
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calc_atr(df, period=14):
+
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    tr = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+
+    return atr
+
+
+# ============================================================
+# MACD
+# ============================================================
+
+def calc_macd(
+    close,
+    fast=12,
+    slow=26,
+    signal=9
+):
+
+    ema_fast = close.ewm(
+        span=fast,
+        adjust=False
+    ).mean()
+
+    ema_slow = close.ewm(
+        span=slow,
+        adjust=False
+    ).mean()
+
+    macd = ema_fast - ema_slow
+
+    signal_line = macd.ewm(
+        span=signal,
+        adjust=False
+    ).mean()
+
+    histogram = macd - signal_line
+
+    return macd, signal_line, histogram
+
+
+# ============================================================
+# 讀取股票池
+# ============================================================
+
+@st.cache_data
+def load_stock_pool():
+
+    df = pd.read_excel(
+        STOCK_POOL_FILE
+    )
+
+    required = [
+        "股票代號",
+        "股票名稱",
+        "市場",
+        "Yahoo代號"
+    ]
+
+    for col in required:
+
+        if col not in df.columns:
+            raise RuntimeError(
+                f"股票池缺少欄位：{col}"
+            )
+
+    df = df.dropna(
+        subset=["Yahoo代號"]
+    ).copy()
+
+    df["Yahoo代號"] = (
+        df["Yahoo代號"]
+        .astype(str)
+        .str.strip()
+    )
+
+    df = df[
+        df["Yahoo代號"] != ""
+    ]
+
+    return df
+
+
+# ============================================================
+# 批次下載
+# ============================================================
+
+def download_batch(tickers):
+
+    try:
+
+        data = yf.download(
+            tickers=tickers,
+            period=PERIOD,
+            interval="1d",
+            auto_adjust=False,
+            group_by="column",
+            threads=True,
+            progress=False
+        )
+
+        if data is None or data.empty:
+            return None
+
+        return data
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# 整批下載
+# ============================================================
+
+@st.cache_data(ttl=900)
+def download_all_data(tickers):
+
+    all_data = {}
+
+    batches = [
+        tickers[i:i + BATCH_SIZE]
+        for i in range(
+            0,
+            len(tickers),
+            BATCH_SIZE
+        )
+    ]
+
+    progress = st.progress(0)
+
+    status = st.empty()
+
+    for i, batch in enumerate(
+        batches,
+        1
+    ):
+
+        status.text(
+            f"正在下載第 {i}/{len(batches)} 批，共 {len(batch)} 檔"
+        )
+
+        data = download_batch(
+            batch
+        )
+
+        if data is not None:
+
+            # yfinance 多股票格式
+            if isinstance(
+                data.columns,
+                pd.MultiIndex
+            ):
+
+                for ticker in batch:
+
+                    try:
+
+                        if ticker not in data.columns.get_level_values(1):
+                            continue
+
+                        df = data.xs(
+                            ticker,
+                            axis=1,
+                            level=1
+                        ).copy()
+
+                        if not df.empty:
+                            all_data[ticker] = df
+
+                    except Exception:
+                        continue
+
+            else:
+
+                if len(batch) == 1:
+
+                    all_data[batch[0]] = data.copy()
+
+        progress.progress(
+            i / len(batches)
+        )
+
+        time.sleep(0.2)
+
+    status.text(
+        f"資料下載完成，共取得 {len(all_data)} 檔"
+    )
+
+    return all_data
+
+
+# ============================================================
+# 股票代號
+# ============================================================
+
+def get_stock_code(ticker):
+
+    return (
+        str(ticker)
+        .replace(".TW", "")
+        .replace(".TWO", "")
+    )
+
+
+# ============================================================
+# 單一股票計算
+# ============================================================
+
+def process_stock(
+    ticker,
+    df,
+    stock_info
+):
+
+    if df is None or df.empty:
+        return None
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    for col in required:
+
+        if col not in df.columns:
+            return None
+
+    df = df.copy()
+
+    df = df.dropna(
+        subset=required
+    )
+
+    if len(df) < 30:
+        return None
+
+    close = df["Close"]
+    volume = df["Volume"]
+
+    price = float(
+        close.iloc[-1]
+    )
+
+    previous_close = float(
+        close.iloc[-2]
+    )
+
+    change_pct = (
+        (price / previous_close - 1)
+        * 100
+    )
+
+    today_volume = float(
+        volume.iloc[-1]
+    )
+
+    today_lots = (
+        today_volume / 1000
+    )
+
+    amount = (
+        price * today_volume
+    )
+
+    avg5_volume = (
+        volume.iloc[-5:].mean()
+        / 1000
+    )
+
+    avg20_volume = (
+        volume.iloc[-20:].mean()
+        / 1000
+    )
+
+    avg5_amount = (
+        (
+            close.iloc[-5:]
+            * volume.iloc[-5:]
+        ).mean()
+    )
+
+    volume_ratio = (
+        today_lots / avg5_volume
+        if avg5_volume > 0
+        else 0
+    )
+
+    volume_strength = (
+        avg5_volume / avg20_volume
+        if avg20_volume > 0
+        else 0
+    )
+
+    # --------------------------------------------------------
+    # 流動性篩選
+    # --------------------------------------------------------
+
+    if amount < MIN_AMOUNT:
+        return None
+
+    if today_lots < MIN_VOLUME:
+        return None
+
+    if avg5_amount < MIN_AVG_AMOUNT:
+        return None
+
+    if avg5_volume < MIN_AVG_VOLUME:
+        return None
+
+    # --------------------------------------------------------
+    # 均線
+    # --------------------------------------------------------
+
+    ma5 = close.rolling(5).mean().iloc[-1]
+    ma10 = close.rolling(10).mean().iloc[-1]
+    ma20 = close.rolling(20).mean().iloc[-1]
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi_series = calc_rsi(
+        close,
+        14
+    )
+
+    rsi14 = float(
+        rsi_series.iloc[-1]
+    )
+
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
+
+    atr_series = calc_atr(
+        df,
+        14
+    )
+
+    atr = float(
+        atr_series.iloc[-1]
+    )
+
+    atr_pct = (
+        atr / price * 100
+        if price > 0
+        else 0
+    )
+
+    # --------------------------------------------------------
+    # 當日振幅
+    # --------------------------------------------------------
+
+    today_high = float(
+        df["High"].iloc[-1]
+    )
+
+    today_low = float(
+        df["Low"].iloc[-1]
+    )
+
+    amplitude_pct = (
+        (today_high - today_low)
+        / price
+        * 100
+    )
+
+    # --------------------------------------------------------
+    # MACD
+    # --------------------------------------------------------
+
+    macd, macd_signal, macd_hist = calc_macd(
+        close
+    )
+
+    macd_value = float(
+        macd.iloc[-1]
+    )
+
+    macd_signal_value = float(
+        macd_signal.iloc[-1]
+    )
+
+    macd_hist_value = float(
+        macd_hist.iloc[-1]
+    )
+
+    return {
+
+        "股票代號": stock_info["股票代號"],
+        "股票名稱": stock_info["股票名稱"],
+        "市場": stock_info["市場"],
+
+        "Yahoo代號": ticker,
+
+        "收盤價": price,
+
+        "漲跌幅%": change_pct,
+
+        "成交量(張)": today_lots,
+
+        "5日平均成交量(張)": avg5_volume,
+
+        "成交金額(億元)": amount / 100_000_000,
+
+        "5日平均成交金額(億元)": (
+            avg5_amount / 100_000_000
+        ),
+
+        "量比": volume_ratio,
+
+        "量能強度": volume_strength,
+
+        "MA5": ma5,
+        "MA10": ma10,
+        "MA20": ma20,
+
+        "RSI14": rsi14,
+
+        "ATR": atr,
+
+        "ATR%": atr_pct,
+
+        "當日振幅%": amplitude_pct,
+
+        "MACD": macd_value,
+
+        "MACD訊號": macd_signal_value,
+
+        "MACD柱": macd_hist_value
+    }
+
+
+# ============================================================
+# 100分制
+# ============================================================
+
+def calculate_score(row):
+
+    score = 0
+
+    # --------------------------------------------------------
+    # 成交金額
+    # --------------------------------------------------------
+
+    amount = row["成交金額(億元)"]
+
+    if amount >= 20:
+        score += 20
+
+    elif amount >= 10:
+        score += 17
+
+    elif amount >= 5:
+        score += 14
+
+    else:
+        score += 10
+
+    # --------------------------------------------------------
+    # 量比
+    # --------------------------------------------------------
+
+    vr = row["量比"]
+
+    if vr >= 3:
+        score += 20
+
+    elif vr >= 2:
+        score += 17
+
+    elif vr >= 1.5:
+        score += 14
+
+    elif vr >= 1:
+        score += 10
+
+    else:
+        score += 5
+
+    # --------------------------------------------------------
+    # 波動
+    # --------------------------------------------------------
+
+    atr = row["ATR%"]
+
+    if 2 <= atr <= 7:
+        score += 15
+
+    elif atr <= 10:
+        score += 11
+
+    elif atr <= 15:
+        score += 7
+
+    else:
+        score += 3
+
+    # --------------------------------------------------------
+    # 趨勢
+    # --------------------------------------------------------
+
+    price = row["收盤價"]
+
+    if (
+        price > row["MA5"]
+        and row["MA5"] > row["MA10"]
+        and row["MA10"] > row["MA20"]
+    ):
+
+        score += 20
+
+    elif price > row["MA20"]:
+
+        score += 13
+
+    else:
+
+        score += 6
+
+    # --------------------------------------------------------
+    # 動能
+    # --------------------------------------------------------
+
+    if row["MACD柱"] > 0:
+        score += 10
+
+    else:
+        score += 5
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi = row["RSI14"]
+
+    if 50 <= rsi <= 70:
+
+        score += 15
+
+    elif 45 <= rsi < 50:
+
+        score += 10
+
+    elif 70 < rsi <= 75:
+
+        score += 8
+
+    elif 75 < rsi <= 80:
+
+        score += 4
+
+    elif rsi > 80:
+
+        score += 0
+
+    else:
+
+        score += 5
+
+    return min(
+        score,
+        100
+    )
+
+
+# ============================================================
+# 當沖訊號
+# ============================================================
+
+def judgement(row):
+
+    rsi = row["RSI14"]
+    change = row["漲跌幅%"]
+    volume_ratio = row["量比"]
+    atr = row["ATR%"]
+
+    price = row["收盤價"]
+
+    ma5 = row["MA5"]
+    ma10 = row["MA10"]
+    ma20 = row["MA20"]
+
+    macd_hist = row["MACD柱"]
+
+    # --------------------------------------------------------
+    # 過熱
+    # --------------------------------------------------------
+
+    if rsi >= 80:
+
+        return (
+            "過熱不追",
+            "RSI ≥ 80，短線過熱"
+        )
+
+    # --------------------------------------------------------
+    # 偏空
+    # --------------------------------------------------------
+
+    if (
+        price < ma20
+        and macd_hist < 0
+        and change < -2
+    ):
+
+        return (
+            "偏空高風險",
+            "跌破月線且 MACD 偏弱"
+        )
+
+    # --------------------------------------------------------
+    # 極端波動
+    # --------------------------------------------------------
+
+    if atr >= 10:
+
+        return (
+            "極端波動",
+            "ATR 過高，需控制部位"
+        )
+
+    # --------------------------------------------------------
+    # 突破
+    # --------------------------------------------------------
+
+    if (
+        price > ma5
+        and ma5 > ma10
+        and ma10 > ma20
+        and volume_ratio >= 2
+        and macd_hist > 0
+        and 50 <= rsi < 75
+    ):
+
+        return (
+            "突破買進觀察",
+            "均線多頭＋量能放大＋MACD偏多"
+        )
+
+    # --------------------------------------------------------
+    # 偏多
+    # --------------------------------------------------------
+
+    if (
+        price > ma20
+        and macd_hist > 0
+        and rsi >= 50
+    ):
+
+        return (
+            "偏多觀察",
+            "股價站上月線且動能偏多"
+        )
+
+    # --------------------------------------------------------
+    # 回檔
+    # --------------------------------------------------------
+
+    if (
+        price >= ma20
+        and price <= ma5 * 1.02
+        and macd_hist >= 0
+        and 45 <= rsi <= 70
+    ):
+
+        return (
+            "回檔買進觀察",
+            "多頭架構中的短線回檔"
+        )
+
+    # --------------------------------------------------------
+    # 量能
+    # --------------------------------------------------------
+
+    if volume_ratio < 0.8:
+
+        return (
+            "量能不足",
+            "今日成交量低於近期平均"
+        )
+
+    # --------------------------------------------------------
+    # 高波動
+    # --------------------------------------------------------
+
+    if atr >= 7:
+
+        return (
+            "高波動控制部位",
+            "波動較大，需控制交易部位"
+        )
+
+    # --------------------------------------------------------
+    # 等待
+    # --------------------------------------------------------
+
+    if volume_ratio >= 1.5:
+
+        return (
+            "等待確認",
+            "量能增加但趨勢尚未完全確認"
+        )
+
+    return (
+        "觀望",
+        "目前訊號不足"
+    )
+
+
+# ============================================================
+# 交易計畫
+# ============================================================
+
+def trade_levels(row):
+
+    price = row["收盤價"]
+
+    atr = row["ATR"]
+
+    signal = row["當沖訊號"]
+
+    if signal == "突破買進觀察":
+
+        entry = price
+
+        stop = price - atr * 0.8
+
+        target1 = price + atr * 1.2
+
+        target2 = price + atr * 2.0
+
+    elif signal == "回檔買進觀察":
+
+        entry = price
+
+        stop = price - atr * 0.8
+
+        target1 = price + atr * 1.0
+
+        target2 = price + atr * 1.8
+
+    else:
+
+        entry = price
+
+        stop = price - atr
+
+        target1 = price + atr
+
+        target2 = price + atr * 1.5
+
+    risk = abs(
+        entry - stop
+    )
+
+    reward1 = (
+        target1 - entry
+    )
+
+    reward2 = (
+        target2 - entry
+    )
+
+    rr1 = (
+        reward1 / risk
+        if risk > 0
+        else 0
+    )
+
+    rr2 = (
+        reward2 / risk
+        if risk > 0
+        else 0
+    )
+
+    return pd.Series({
+
+        "進場參考價": entry,
+
+        "回檔買進價": (
+            price - atr * 0.3
+        ),
+
+        "停損參考價": stop,
+
+        "第一目標價": target1,
+
+        "第二目標價": target2,
+
+        "風險報酬比1": rr1,
+
+        "風險報酬比2": rr2
+    })
+
+
+# ============================================================
+# 主分析
+# ============================================================
+
+def run_analysis():
+
+    stock_pool = load_stock_pool()
+
+    tickers = (
+        stock_pool["Yahoo代號"]
+        .tolist()
+    )
+
+    data = download_all_data(
+        tuple(tickers)
+    )
+
+    results = []
+
+    info_map = (
+        stock_pool
+        .set_index("Yahoo代號")
+        .to_dict("index")
+    )
+
+    for ticker, df in data.items():
+
+        if ticker not in info_map:
+            continue
+
+        result = process_stock(
+            ticker,
+            df,
+            info_map[ticker]
+        )
+
+        if result is not None:
+
+            results.append(
+                result
+            )
+
+    if not results:
+
+        return pd.DataFrame()
+
+    result_df = pd.DataFrame(
+        results
+    )
+
+    # --------------------------------------------------------
+    # 分數
+    # --------------------------------------------------------
+
+    result_df["當沖強度"] = (
+        result_df.apply(
+            calculate_score,
+            axis=1
+        )
+    )
+
+    # --------------------------------------------------------
+    # 訊號
+    # --------------------------------------------------------
+
+    signals = result_df.apply(
+        judgement,
+        axis=1
+    )
+
+    result_df["當沖訊號"] = (
+        signals.apply(
+            lambda x: x[0]
+        )
+    )
+
+    result_df["訊號理由"] = (
+        signals.apply(
+            lambda x: x[1]
+        )
+    )
+
+    # --------------------------------------------------------
+    # 交易計畫
+    # --------------------------------------------------------
+
+    levels = result_df.apply(
+        trade_levels,
+        axis=1
+    )
+
+    result_df = pd.concat(
+        [
+            result_df,
+            levels
+        ],
+        axis=1
+    )
+
+    # --------------------------------------------------------
+    # 適合度
+    # --------------------------------------------------------
+
+    def suitability(score):
+
+        if score >= 90:
+            return "★★★★★ 極佳"
+
+        elif score >= 80:
+            return "★★★★☆ 很佳"
+
+        elif score >= 70:
+            return "★★★☆☆ 良好"
+
+        elif score >= 60:
+            return "★★☆☆☆ 普通"
+
+        else:
+            return "★☆☆☆☆ 不建議"
+
+    result_df["當沖適合度"] = (
+        result_df["當沖強度"]
+        .apply(suitability)
+    )
+
+    # --------------------------------------------------------
+    # 風險
+    # --------------------------------------------------------
+
+    def risk(row):
+
+        if row["ATR%"] >= 10:
+            return "極高風險"
+
+        elif row["ATR%"] >= 7:
+            return "高風險"
+
+        elif row["ATR%"] >= 4:
+            return "中風險"
+
+        else:
+            return "低風險"
+
+    result_df["當沖風險"] = (
+        result_df.apply(
+            risk,
+            axis=1
+        )
+    )
+
+    # --------------------------------------------------------
+    # 操作建議
+    # --------------------------------------------------------
+
+    def advice(signal):
+
+        mapping = {
+
+            "突破買進觀察":
+                "等待突破確認後再考慮",
+
+            "回檔買進觀察":
+                "等待回檔止穩",
+
+            "偏多觀察":
+                "偏多觀察",
+
+            "量能不足":
+                "暫不進場",
+
+            "偏空高風險":
+                "避免追多",
+
+            "過熱不追":
+                "避免追高",
+
+            "極端波動":
+                "降低部位",
+
+            "高波動控制部位":
+                "控制交易部位",
+
+            "等待確認":
+                "等待訊號確認",
+
+            "觀望":
+                "觀察"
+        }
+
+        return mapping.get(
+            signal,
+            "觀察"
+        )
+
+    result_df["操作建議"] = (
+        result_df["當沖訊號"]
+        .apply(advice)
+    )
+
+    # --------------------------------------------------------
+    # 排序
+    # --------------------------------------------------------
+
+    result_df = result_df.sort_values(
+        [
+            "當沖強度",
+            "量比"
+        ],
+        ascending=False
+    ).reset_index(
+        drop=True
+    )
+
+    return result_df
+
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+
+st.title("📈 台股當沖選股 v9")
+
+st.caption(
+    "雲端版｜自動抓取 Yahoo Finance 資料｜手機可使用"
+)
+
+# ------------------------------------------------------------
+# 更新按鈕
+# ------------------------------------------------------------
+
+if st.button(
+    "🔄 更新資料並開始選股",
+    type="primary",
+    use_container_width=True
+):
+
+    with st.spinner(
+        "正在下載台股資料並分析，請稍候..."
+    ):
+
+        try:
+
+            result_df = run_analysis()
+
+            st.session_state[
+                "result_df"
+            ] = result_df
+
+            st.session_state[
+                "update_time"
+            ] = datetime.now()
+
+        except Exception as e:
+
+            st.error(
+                f"程式發生錯誤：{e}"
+            )
+
+# ------------------------------------------------------------
+# 顯示結果
+# ------------------------------------------------------------
+
+if "result_df" in st.session_state:
+
+    result_df = st.session_state[
+        "result_df"
+    ]
+
+    update_time = st.session_state.get(
+        "update_time"
+    )
+
+    if update_time:
+
+        st.info(
+            "最後更新："
+            + update_time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+
+    if result_df.empty:
+
+        st.warning(
+            "目前沒有符合條件的股票。"
+        )
+
+    else:
+
+        st.success(
+            f"符合條件：{len(result_df)} 檔"
+        )
+
+        # ====================================================
+        # TOP 10
+        # ====================================================
+
+        st.subheader(
+            "🏆 台股當沖 TOP 10"
+        )
+
+        top10 = result_df.head(
+            TOP_N
+        ).copy()
+
+        display_cols = [
+
+            "股票代號",
+            "股票名稱",
+            "收盤價",
+            "漲跌幅%",
+            "成交量(張)",
+            "5日平均成交量(張)",
+            "成交金額(億元)",
+            "量比",
+            "RSI14",
+            "ATR%",
+            "當沖強度",
+            "當沖訊號",
+            "當沖適合度",
+            "當沖風險"
+        ]
+
+        st.dataframe(
+            top10[
+                display_cols
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ====================================================
+        # 突破
+        # ====================================================
+
+        breakout = result_df[
+            result_df["當沖訊號"]
+            == "突破買進觀察"
+        ]
+
+        st.subheader(
+            "🚀 突破買進觀察"
+        )
+
+        if breakout.empty:
+
+            st.write(
+                "目前沒有符合條件的股票。"
+            )
+
+        else:
+
+            st.dataframe(
+                breakout[
+                    display_cols
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # ====================================================
+        # 回檔
+        # ====================================================
+
+        pullback = result_df[
+            result_df["當沖訊號"]
+            == "回檔買進觀察"
+        ]
+
+        st.subheader(
+            "↩️ 回檔買進觀察"
+        )
+
+        if pullback.empty:
+
+            st.write(
+                "目前沒有符合條件的股票。"
+            )
+
+        else:
+
+            st.dataframe(
+                pullback[
+                    display_cols
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # ====================================================
+        # 詳細交易計畫
+        # ====================================================
+
+        st.subheader(
+            "🎯 TOP 10 交易計畫"
+        )
+
+        plan_cols = [
+
+            "股票代號",
+            "股票名稱",
+            "收盤價",
+            "當沖訊號",
+            "訊號理由",
+            "進場參考價",
+            "回檔買進價",
+            "停損參考價",
+            "第一目標價",
+            "第二目標價",
+            "風險報酬比1",
+            "風險報酬比2",
+            "操作建議"
+        ]
+
+        st.dataframe(
+            top10[
+                plan_cols
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ====================================================
+        # 完整資料
+        # ====================================================
+
+        with st.expander(
+            "📊 查看全部符合條件股票"
+        ):
+
+            st.dataframe(
+                result_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+else:
+
+    st.info(
+        "👆 按上面的「更新資料並開始選股」開始分析。"
+    )
